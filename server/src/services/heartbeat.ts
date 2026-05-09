@@ -32,6 +32,7 @@ import {
   issueWorkProducts,
   projects,
   projectWorkspaces,
+  routines,
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
@@ -915,6 +916,78 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export interface RunLifecycleDisplayIssue {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+}
+
+export interface RunLifecycleDisplayRoutine {
+  id: string;
+  title: string;
+}
+
+export function buildRunLifecycleDisplayName(input: {
+  agentName: string | null;
+  issue: RunLifecycleDisplayIssue | null;
+  routine: RunLifecycleDisplayRoutine | null;
+}) {
+  if (input.issue) {
+    const title = input.issue.title.trim();
+    if (input.issue.identifier && title) return `${input.issue.identifier}: ${title}`;
+    if (input.issue.identifier) return input.issue.identifier;
+    if (title) return title;
+  }
+  if (input.routine) return input.routine.title;
+  return input.agentName ?? "Agent";
+}
+
+export function buildRunLifecyclePluginPayload(input: {
+  run: {
+    id: string;
+    agentId: string;
+    status: string;
+    invocationSource: string | null;
+    triggerDetail: string | null;
+    error: string | null;
+    errorCode: string | null;
+    startedAt: Date | null;
+    finishedAt: Date | null;
+  };
+  agentName: string | null;
+  issueId: string | null;
+  issue: RunLifecycleDisplayIssue | null;
+  routine: RunLifecycleDisplayRoutine | null;
+}) {
+  const runDisplayName = buildRunLifecycleDisplayName({
+    agentName: input.agentName,
+    issue: input.issue,
+    routine: input.routine,
+  });
+
+  return {
+    runId: input.run.id,
+    agentId: input.run.agentId,
+    agentName: runDisplayName,
+    agentActualName: input.agentName,
+    runDisplayName,
+    status: input.run.status,
+    invocationSource: input.run.invocationSource,
+    triggerDetail: input.run.triggerDetail,
+    error: input.run.error ?? null,
+    errorCode: input.run.errorCode ?? null,
+    issueId: input.issue?.id ?? input.issueId ?? null,
+    issueIdentifier: input.issue?.identifier ?? null,
+    issueTitle: input.issue?.title ?? null,
+    issueStatus: input.issue?.status ?? null,
+    routineId: input.routine?.id ?? null,
+    routineTitle: input.routine?.title ?? null,
+    startedAt: input.run.startedAt ? new Date(input.run.startedAt).toISOString() : null,
+    finishedAt: input.run.finishedAt ? new Date(input.run.finishedAt).toISOString() : null,
+  };
 }
 
 export function summarizeHeartbeatRunContextSnapshot(
@@ -2687,13 +2760,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
         },
       });
-      publishRunLifecyclePluginEvent(updated);
+      await publishRunLifecyclePluginEvent(updated);
     }
 
     return updated;
   }
 
-  function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
+  async function getRunLifecycleIssueContext(companyId: string, issueId: string) {
+    const issue = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        originKind: issues.originKind,
+        originId: issues.originId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue) return null;
+
+    const routine = issue.originKind === "routine_execution" && issue.originId
+      ? await db
+        .select({
+          id: routines.id,
+          title: routines.title,
+        })
+        .from(routines)
+        .where(and(eq(routines.id, issue.originId), eq(routines.companyId, companyId)))
+        .then((rows) => rows[0] ?? null)
+      : null;
+
+    return { issue, routine };
+  }
+
+  async function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
     const eventType =
       run.status === "running"
         ? "agent.run.started"
@@ -2705,30 +2808,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "agent.run.cancelled"
               : null;
     if (!eventType) return;
-    publishPluginDomainEvent({
-      eventId: randomUUID(),
-      eventType,
-      occurredAt: new Date().toISOString(),
-      actorId: run.agentId,
-      actorType: "agent",
-      entityId: run.id,
-      entityType: "heartbeat_run",
-      companyId: run.companyId,
-      payload: {
-        runId: run.id,
-        agentId: run.agentId,
-        status: run.status,
-        invocationSource: run.invocationSource,
-        triggerDetail: run.triggerDetail,
-        error: run.error ?? null,
-        errorCode: run.errorCode ?? null,
-        issueId: typeof run.contextSnapshot === "object" && run.contextSnapshot !== null
-          ? (run.contextSnapshot as Record<string, unknown>).issueId ?? null
-          : null,
-        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
-        finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
-      },
-    });
+    try {
+      const context = parseObject(run.contextSnapshot);
+      const issueId = readNonEmptyString(context.issueId);
+      const [agent, issueContext] = await Promise.all([
+        getAgent(run.agentId),
+        issueId ? getRunLifecycleIssueContext(run.companyId, issueId) : Promise.resolve(null),
+      ]);
+
+      publishPluginDomainEvent({
+        eventId: randomUUID(),
+        eventType,
+        occurredAt: new Date().toISOString(),
+        actorId: run.agentId,
+        actorType: "agent",
+        entityId: run.id,
+        entityType: "heartbeat_run",
+        companyId: run.companyId,
+        payload: buildRunLifecyclePluginPayload({
+          run,
+          agentName: agent?.name ?? null,
+          issueId,
+          issue: issueContext?.issue ?? null,
+          routine: issueContext?.routine ?? null,
+        }),
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to publish run lifecycle plugin event");
+    }
   }
 
   async function setWakeupStatus(
@@ -3860,7 +3967,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: claimed.finishedAt ? new Date(claimed.finishedAt).toISOString() : null,
       },
     });
-    publishRunLifecyclePluginEvent(claimed);
+    await publishRunLifecyclePluginEvent(claimed);
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
