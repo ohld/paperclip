@@ -4224,6 +4224,7 @@ export function heartbeatService(db: Db) {
           companyId: issues.companyId,
           identifier: issues.identifier,
           status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
           executionRunId: issues.executionRunId,
         })
         .from(issues)
@@ -4296,8 +4297,48 @@ export function heartbeatService(db: Db) {
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
+        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        const deferredCommentRows = deferredCommentIds.length > 0
+          ? await tx
+            .select({
+              id: issueComments.id,
+              createdByRunId: issueComments.createdByRunId,
+            })
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.companyId, issue.companyId),
+              eq(issueComments.issueId, issue.id),
+              inArray(issueComments.id, deferredCommentIds),
+            ))
+          : [];
+        const terminalIssueStatus = issue.status === "done" || issue.status === "cancelled";
+        const explicitDeferredFollowup =
+          deferredWakeReason === "issue_reopened_via_comment" ||
+          promotedContextSeed.resumeIntent === true ||
+          promotedContextSeed.followUpRequested === true;
+        const deferredWakeOnlyContainsCurrentRunComments =
+          deferredCommentIds.length > 0 &&
+          deferredCommentRows.length === deferredCommentIds.length &&
+          deferredCommentRows.every((comment) => comment.createdByRunId === run.id);
+        if (
+          terminalIssueStatus &&
+          !explicitDeferredFollowup &&
+          issue.assigneeAgentId === deferred.agentId &&
+          deferredWakeOnlyContainsCurrentRunComments
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake suppressed because the wake comment was run completion bookkeeping",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 && (issue.status === "done" || issue.status === "cancelled");
+          deferredCommentIds.length > 0 && terminalIssueStatus;
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
